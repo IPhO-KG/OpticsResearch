@@ -1,0 +1,937 @@
+"""One-file triangular-prism Moser + Dijkstra playground.
+
+How to use in Anaconda/Spyder:
+1. Open this file.
+2. Change only the SETTINGS block below.
+3. Press Run (F5).
+
+Dependencies: numpy and matplotlib (both are included in standard Anaconda).
+The ray is constrained to travel through the left and right prism faces in the
+order air -> glass -> air. Both contact points are found numerically.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import heapq
+import math
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+# =============================================================================
+# SETTINGS: edit this block and run the file again
+# =============================================================================
+
+SOURCE = (-5.0, 1.0)
+TARGET = (5.0, 0.3)
+
+# Prism vertices: left base, apex, right base.
+APEX = (0.0, 3.0)
+LEFT_BASE = (-2.0, 3.0 - 2.0 * math.sqrt(3.0))
+RIGHT_BASE = (2.0, 3.0 - 2.0 * math.sqrt(3.0))
+
+N_OUTSIDE = 1.0
+N_PRISM = 1.5
+
+# h controls spatial scale; q mainly controls the number of graph directions.
+# Good first experiments: (h, q) = (1, 3), (1, 7), (0.5, 7), (0.5, 15).
+H = 1.0
+Q = 7
+
+# xmin, xmax, ymin, ymax. Width and height must be integer multiples of h.
+DOMAIN = (-6.0, 6.0, -4.0, 5.0)
+
+SHOW_ALL_NODES = True
+SAVE_FIGURES = False
+OUTPUT_DIRECTORY = Path("prism_playground_results")
+
+
+# =============================================================================
+# Geometry
+# =============================================================================
+
+Point = tuple[float, float]
+
+
+def distance(first: Point, second: Point) -> float:
+    return math.hypot(first[0] - second[0], first[1] - second[1])
+
+
+def dot(first: Point, second: Point) -> float:
+    return first[0] * second[0] + first[1] * second[1]
+
+
+def subtract(first: Point, second: Point) -> Point:
+    return (first[0] - second[0], first[1] - second[1])
+
+
+def segment_vector(first: Point, second: Point) -> Point:
+    return (second[0] - first[0], second[1] - first[1])
+
+
+def segment_point(first: Point, second: Point, parameter: float) -> Point:
+    return (
+        first[0] + parameter * (second[0] - first[0]),
+        first[1] + parameter * (second[1] - first[1]),
+    )
+
+
+def segment_parameter(first: Point, second: Point, point: Point) -> float:
+    vector = segment_vector(first, second)
+    return dot(subtract(point, first), vector) / dot(vector, vector)
+
+
+@dataclass(frozen=True)
+class InwardLine:
+    point: Point
+    normal: Point
+
+    def signed_distance(self, candidate: Point) -> float:
+        return dot(subtract(candidate, self.point), self.normal)
+
+
+def inward_line(first: Point, second: Point, interior_point: Point) -> InwardLine:
+    vector = segment_vector(first, second)
+    length = math.hypot(*vector)
+    if length == 0.0:
+        raise ValueError("Prism edge has zero length.")
+    normal = (-vector[1] / length, vector[0] / length)
+    line = InwardLine(first, normal)
+    if line.signed_distance(interior_point) < 0.0:
+        line = InwardLine(first, (-normal[0], -normal[1]))
+    return line
+
+
+def nodes_on_segment(
+    points: tuple[Point, ...],
+    first: Point,
+    second: Point,
+    tolerance: float,
+    *,
+    include_endpoints: bool,
+) -> tuple[int, ...]:
+    vector = segment_vector(first, second)
+    length = math.hypot(*vector)
+    parameter_tolerance = tolerance / length
+    answer = []
+    for node_id, point in enumerate(points):
+        parameter = segment_parameter(first, second, point)
+        if parameter < -parameter_tolerance or parameter > 1.0 + parameter_tolerance:
+            continue
+        projection = segment_point(first, second, min(1.0, max(0.0, parameter)))
+        if distance(point, projection) > tolerance:
+            continue
+        if not include_endpoints and (
+            parameter <= parameter_tolerance
+            or parameter >= 1.0 - parameter_tolerance
+        ):
+            continue
+        answer.append(node_id)
+    return tuple(answer)
+
+
+# =============================================================================
+# Moser graph
+# =============================================================================
+
+@dataclass(frozen=True)
+class Graph:
+    points: tuple[Point, ...]
+    adjacency: tuple[tuple[tuple[int, float], ...], ...]
+    edge_count: int
+    attempted_chords: int
+
+    def edge_weight(self, first: int, second: int) -> float:
+        for target, weight in self.adjacency[first]:
+            if target == second:
+                return weight
+        raise KeyError(f"Nodes {first} and {second} are not adjacent.")
+
+    def path_cost(self, path: tuple[int, ...]) -> float:
+        return sum(
+            self.edge_weight(first, second)
+            for first, second in zip(path, path[1:])
+        )
+
+
+def cells_containing_coordinate(
+    coordinate: float,
+    lower: float,
+    cell_size: float,
+    cell_count: int,
+    tolerance: float = 1e-11,
+) -> tuple[int, ...]:
+    scaled = (coordinate - lower) / cell_size
+    nearest = round(scaled)
+    candidates = (
+        (nearest - 1, nearest)
+        if math.isclose(scaled, nearest, rel_tol=0.0, abs_tol=tolerance)
+        else (math.floor(scaled),)
+    )
+    return tuple(index for index in candidates if 0 <= index < cell_count)
+
+
+def build_moser_graph(
+    domain: tuple[float, float, float, float],
+    cell_size: float,
+    q: int,
+    extra_points: tuple[Point, ...],
+) -> tuple[Graph, dict[Point, int], float]:
+    xmin, xmax, ymin, ymax = domain
+    if cell_size <= 0.0 or q < 0:
+        raise ValueError("h must be positive and q must be non-negative.")
+    cells_x_float = (xmax - xmin) / cell_size
+    cells_y_float = (ymax - ymin) / cell_size
+    if not math.isclose(cells_x_float, round(cells_x_float), abs_tol=1e-10):
+        raise ValueError("Domain width must be an integer multiple of h.")
+    if not math.isclose(cells_y_float, round(cells_y_float), abs_tol=1e-10):
+        raise ValueError("Domain height must be an integer multiple of h.")
+
+    cells_x = round(cells_x_float)
+    cells_y = round(cells_y_float)
+    intervals = q + 1
+    step = cell_size / intervals
+    points: list[Point] = []
+    adjacency: list[dict[int, float]] = []
+    key_to_id: dict[object, int] = {}
+    coordinate_to_key: dict[Point, object] = {}
+    cell_keys: dict[tuple[int, int], set[object]] = {}
+
+    def coordinate_key(point: Point) -> Point:
+        return (round(point[0], 12), round(point[1], 12))
+
+    def add_node(point: Point) -> int:
+        node_id = len(points)
+        points.append((float(point[0]), float(point[1])))
+        adjacency.append({})
+        return node_id
+
+    def lattice_point(key: tuple[int, int]) -> Point:
+        return (xmin + key[0] * step, ymin + key[1] * step)
+
+    def register_lattice(key: tuple[int, int]) -> None:
+        if key in key_to_id:
+            return
+        point = lattice_point(key)
+        key_to_id[key] = add_node(point)
+        coordinate_to_key[coordinate_key(point)] = key
+
+    for cell_x in range(cells_x):
+        for cell_y in range(cells_y):
+            left = cell_x * intervals
+            bottom = cell_y * intervals
+            keys: set[object] = set()
+            for offset in range(intervals + 1):
+                keys.add((left + offset, bottom))
+                keys.add((left + offset, bottom + intervals))
+                keys.add((left, bottom + offset))
+                keys.add((left + intervals, bottom + offset))
+            for key in keys:
+                register_lattice(key)  # type: ignore[arg-type]
+            cell_keys[(cell_x, cell_y)] = keys
+
+    rounded_extra: dict[Point, object] = {}
+    for point_index, raw_point in enumerate(extra_points):
+        point = (float(raw_point[0]), float(raw_point[1]))
+        if not (xmin <= point[0] <= xmax and ymin <= point[1] <= ymax):
+            raise ValueError(f"Point {point} lies outside DOMAIN.")
+        rounded = (round(point[0], 14), round(point[1], 14))
+        existing = coordinate_to_key.get(coordinate_key(point))
+        if existing is not None and distance(points[key_to_id[existing]], point) <= 1e-11:
+            key = existing
+        else:
+            key = rounded_extra.get(rounded, ("extra", point_index))
+            if key not in key_to_id:
+                key_to_id[key] = add_node(point)
+                rounded_extra[rounded] = key
+                coordinate_to_key[coordinate_key(point)] = key
+
+        containing_x = cells_containing_coordinate(point[0], xmin, cell_size, cells_x)
+        containing_y = cells_containing_coordinate(point[1], ymin, cell_size, cells_y)
+        for cell_x in containing_x:
+            for cell_y in containing_y:
+                cell_keys[(cell_x, cell_y)].add(key)
+
+    attempted = 0
+    for keys in cell_keys.values():
+        node_ids = sorted(key_to_id[key] for key in keys)
+        attempted += len(node_ids) * (len(node_ids) - 1) // 2
+        for first_index, first in enumerate(node_ids):
+            for second in node_ids[first_index + 1 :]:
+                weight = distance(points[first], points[second])
+                if weight == 0.0:
+                    continue
+                old = adjacency[first].get(second)
+                if old is None:
+                    adjacency[first][second] = weight
+                    adjacency[second][first] = weight
+                elif not math.isclose(old, weight, rel_tol=2e-13, abs_tol=2e-15):
+                    raise RuntimeError("Duplicate edge received inconsistent weights.")
+
+    frozen_adjacency = tuple(
+        tuple(sorted(neighbors.items())) for neighbors in adjacency
+    )
+    graph = Graph(
+        points=tuple(points),
+        adjacency=frozen_adjacency,
+        edge_count=sum(len(neighbors) for neighbors in frozen_adjacency) // 2,
+        attempted_chords=attempted,
+    )
+    point_ids = {point: node_id for node_id, point in enumerate(graph.points)}
+    return graph, point_ids, step
+
+
+def find_node(point_ids: dict[Point, int], point: Point, tolerance: float = 1e-11) -> int:
+    direct = point_ids.get((float(point[0]), float(point[1])))
+    if direct is not None:
+        return direct
+    for candidate, node_id in point_ids.items():
+        if distance(candidate, point) <= tolerance:
+            return node_id
+    raise KeyError(f"Point {point} is not in the graph.")
+
+
+# =============================================================================
+# Dijkstra with nonzero multi-source labels
+# =============================================================================
+
+@dataclass(frozen=True)
+class DistanceField:
+    distances: tuple[float, ...]
+    predecessors: tuple[int | None, ...]
+    roots: tuple[int | None, ...]
+    settled_nodes: int
+    relaxations: int
+
+    def root_for(self, target: int) -> int:
+        root = self.roots[target]
+        if root is None or math.isinf(self.distances[target]):
+            raise ValueError(f"Node {target} is unreachable.")
+        return root
+
+    def path_to(self, target: int) -> tuple[int, ...]:
+        root = self.root_for(target)
+        path = [target]
+        while path[-1] != root:
+            predecessor = self.predecessors[path[-1]]
+            if predecessor is None:
+                raise RuntimeError("Broken predecessor chain.")
+            path.append(predecessor)
+        path.reverse()
+        return tuple(path)
+
+
+def dijkstra(
+    graph: Graph,
+    initial_labels: dict[int, float],
+    allowed_nodes: set[int],
+    *,
+    absorbing_nodes: set[int],
+    edge_scale: float,
+    fixed_sources: bool,
+) -> DistanceField:
+    node_count = len(graph.points)
+    if not initial_labels or edge_scale <= 0.0:
+        raise ValueError("Dijkstra needs sources and a positive edge scale.")
+    source_set = set(initial_labels)
+    if not source_set <= allowed_nodes:
+        raise ValueError("A Dijkstra source lies outside its allowed region.")
+
+    distances = [math.inf] * node_count
+    predecessors: list[int | None] = [None] * node_count
+    roots: list[int | None] = [None] * node_count
+    queue: list[tuple[float, int]] = []
+    for source, initial_distance in sorted(initial_labels.items()):
+        if initial_distance < 0.0 or not math.isfinite(initial_distance):
+            raise ValueError("Initial labels must be finite and non-negative.")
+        distances[source] = initial_distance
+        roots[source] = source
+        heapq.heappush(queue, (initial_distance, source))
+
+    settled = [False] * node_count
+    settled_count = 0
+    relaxations = 0
+    while queue:
+        current_distance, node = heapq.heappop(queue)
+        if settled[node] or current_distance > distances[node]:
+            continue
+        settled[node] = True
+        settled_count += 1
+        if node in absorbing_nodes and node not in source_set:
+            continue
+
+        for target, weight in graph.adjacency[node]:
+            if target not in allowed_nodes:
+                continue
+            if fixed_sources and target in source_set:
+                continue
+            relaxations += 1
+            candidate = current_distance + edge_scale * weight
+            if candidate < distances[target]:
+                distances[target] = candidate
+                predecessors[target] = node
+                roots[target] = roots[node]
+                heapq.heappush(queue, (candidate, target))
+
+    return DistanceField(
+        tuple(distances),
+        tuple(predecessors),
+        tuple(roots),
+        settled_count,
+        relaxations,
+    )
+
+
+# =============================================================================
+# Independent continuous benchmark
+# =============================================================================
+
+def continuous_prism_solution(
+    source: Point,
+    target: Point,
+    entry_first: Point,
+    entry_second: Point,
+    exit_first: Point,
+    exit_second: Point,
+    index_outside: float,
+    index_prism: float,
+) -> tuple[float, float, Point, Point, float]:
+    entry_vector = segment_vector(entry_first, entry_second)
+    exit_vector = segment_vector(exit_first, exit_second)
+
+    def projection(vector: Point, direction: Point) -> float:
+        length = math.hypot(*vector)
+        if length == 0.0:
+            raise ValueError("Continuous solution encountered a zero ray segment.")
+        return dot(vector, direction) / length
+
+    def derivative_entry(u: float, v: float) -> float:
+        first_contact = segment_point(entry_first, entry_second, u)
+        second_contact = segment_point(exit_first, exit_second, v)
+        return (
+            index_outside * projection(subtract(first_contact, source), entry_vector)
+            + index_prism
+            * projection(subtract(first_contact, second_contact), entry_vector)
+        )
+
+    def derivative_exit(u: float, v: float) -> float:
+        first_contact = segment_point(entry_first, entry_second, u)
+        second_contact = segment_point(exit_first, exit_second, v)
+        return (
+            index_prism
+            * projection(subtract(second_contact, first_contact), exit_vector)
+            + index_outside * projection(subtract(second_contact, target), exit_vector)
+        )
+
+    def coordinate_minimum(derivative) -> float:
+        lower, upper = 0.0, 1.0
+        if derivative(lower) >= 0.0:
+            return lower
+        if derivative(upper) <= 0.0:
+            return upper
+        for _ in range(100):
+            middle = 0.5 * (lower + upper)
+            if derivative(middle) < 0.0:
+                lower = middle
+            else:
+                upper = middle
+        return 0.5 * (lower + upper)
+
+    u = v = 0.5
+    for _ in range(400):
+        old_u, old_v = u, v
+        u = coordinate_minimum(lambda value: derivative_entry(value, v))
+        v = coordinate_minimum(lambda value: derivative_exit(u, value))
+        if max(abs(u - old_u), abs(v - old_v)) <= 2e-15:
+            break
+
+    first_contact = segment_point(entry_first, entry_second, u)
+    second_contact = segment_point(exit_first, exit_second, v)
+    optical_path = (
+        index_outside * distance(source, first_contact)
+        + index_prism * distance(first_contact, second_contact)
+        + index_outside * distance(second_contact, target)
+    )
+    return u, v, first_contact, second_contact, optical_path
+
+
+def snell_metrics(
+    before: Point,
+    contact: Point,
+    after: Point,
+    normal: Point,
+    index_before: float,
+    index_after: float,
+) -> tuple[float, float, float]:
+    incoming = subtract(contact, before)
+    outgoing = subtract(after, contact)
+    normal_length = math.hypot(*normal)
+    tangent = (-normal[1] / normal_length, normal[0] / normal_length)
+
+    def angle_to_normal(direction: Point) -> float:
+        cosine = abs(dot(direction, normal)) / (math.hypot(*direction) * normal_length)
+        return math.degrees(math.acos(min(1.0, max(0.0, cosine))))
+
+    mismatch = abs(
+        index_before * dot(incoming, tangent) / math.hypot(*incoming)
+        - index_after * dot(outgoing, tangent) / math.hypot(*outgoing)
+    )
+    return angle_to_normal(incoming), angle_to_normal(outgoing), mismatch
+
+
+# =============================================================================
+# Full prism solve
+# =============================================================================
+
+def solve_prism() -> dict[str, object]:
+    if N_OUTSIDE <= 0.0 or N_PRISM <= 0.0:
+        raise ValueError("Refractive indices must be positive.")
+    centroid = (
+        (LEFT_BASE[0] + APEX[0] + RIGHT_BASE[0]) / 3.0,
+        (LEFT_BASE[1] + APEX[1] + RIGHT_BASE[1]) / 3.0,
+    )
+    entry_line = inward_line(LEFT_BASE, APEX, centroid)
+    exit_line = inward_line(APEX, RIGHT_BASE, centroid)
+    base_line = inward_line(RIGHT_BASE, LEFT_BASE, centroid)
+    triangle_lines = (entry_line, exit_line, base_line)
+    if entry_line.signed_distance(SOURCE) >= 0.0:
+        raise ValueError("SOURCE must be outside the left entry face.")
+    if exit_line.signed_distance(TARGET) >= 0.0:
+        raise ValueError("TARGET must be outside the right exit face.")
+
+    face_spacing = H / (Q + 1)
+
+    def face_samples(first: Point, second: Point) -> tuple[Point, ...]:
+        intervals = max(2, math.ceil(distance(first, second) / face_spacing))
+        return tuple(
+            segment_point(first, second, index / intervals)
+            for index in range(1, intervals)
+        )
+
+    inserted_points = (
+        SOURCE,
+        TARGET,
+        *face_samples(LEFT_BASE, APEX),
+        *face_samples(APEX, RIGHT_BASE),
+    )
+    graph, point_ids, graph_step = build_moser_graph(DOMAIN, H, Q, inserted_points)
+    source_id = find_node(point_ids, SOURCE)
+    target_id = find_node(point_ids, TARGET)
+    tolerance = max(1e-11, graph_step * 1e-8)
+    entry_nodes = set(
+        nodes_on_segment(
+            graph.points,
+            LEFT_BASE,
+            APEX,
+            tolerance,
+            include_endpoints=False,
+        )
+    )
+    exit_nodes = set(
+        nodes_on_segment(
+            graph.points,
+            APEX,
+            RIGHT_BASE,
+            tolerance,
+            include_endpoints=False,
+        )
+    )
+    base_nodes = set(
+        nodes_on_segment(
+            graph.points,
+            RIGHT_BASE,
+            LEFT_BASE,
+            tolerance,
+            include_endpoints=True,
+        )
+    )
+    if not entry_nodes or not exit_nodes or entry_nodes & exit_nodes:
+        raise RuntimeError("Prism face-node construction failed.")
+
+    before_nodes = {
+        node_id
+        for node_id, point in enumerate(graph.points)
+        if entry_line.signed_distance(point) < -tolerance
+    }
+    middle_nodes = {
+        node_id
+        for node_id, point in enumerate(graph.points)
+        if all(line.signed_distance(point) > tolerance for line in triangle_lines)
+    }
+    after_nodes = {
+        node_id
+        for node_id, point in enumerate(graph.points)
+        if exit_line.signed_distance(point) < -tolerance
+    }
+
+    from_source = dijkstra(
+        graph,
+        {source_id: 0.0},
+        before_nodes | entry_nodes | {source_id},
+        absorbing_nodes=entry_nodes,
+        edge_scale=N_OUTSIDE,
+        fixed_sources=False,
+    )
+    entry_labels = {
+        node: from_source.distances[node]
+        for node in entry_nodes
+        if math.isfinite(from_source.distances[node])
+    }
+    through_prism = dijkstra(
+        graph,
+        entry_labels,
+        middle_nodes | entry_nodes | exit_nodes,
+        absorbing_nodes=exit_nodes,
+        edge_scale=N_PRISM,
+        fixed_sources=True,
+    )
+    from_target = dijkstra(
+        graph,
+        {target_id: 0.0},
+        after_nodes | exit_nodes | {target_id},
+        absorbing_nodes=exit_nodes,
+        edge_scale=N_OUTSIDE,
+        fixed_sources=False,
+    )
+
+    reachable_exit = [
+        node
+        for node in exit_nodes
+        if math.isfinite(through_prism.distances[node])
+        and math.isfinite(from_target.distances[node])
+    ]
+    if not reachable_exit:
+        raise RuntimeError("No ordered path crosses both prism faces.")
+    exit_node = min(
+        reachable_exit,
+        key=lambda node: (
+            through_prism.distances[node] + from_target.distances[node],
+            node,
+        ),
+    )
+    entry_node = through_prism.root_for(exit_node)
+    first_path = from_source.path_to(entry_node)
+    middle_path = through_prism.path_to(exit_node)
+    last_path = tuple(reversed(from_target.path_to(exit_node)))
+    path = first_path + middle_path[1:] + last_path[1:]
+
+    entry_contacts = [node for node in path if node in entry_nodes]
+    exit_contacts = [node for node in path if node in exit_nodes]
+    base_contacts = [node for node in path if node in base_nodes]
+    if entry_contacts != [entry_node] or exit_contacts != [exit_node] or base_contacts:
+        raise RuntimeError("The recovered path violated the two-contact topology.")
+
+    numerical_optical_path = (
+        N_OUTSIDE * graph.path_cost(first_path)
+        + N_PRISM * graph.path_cost(middle_path)
+        + N_OUTSIDE * graph.path_cost(last_path)
+    )
+    numerical_entry = graph.points[entry_node]
+    numerical_exit = graph.points[exit_node]
+    exact_u, exact_v, exact_entry, exact_exit, exact_optical_path = (
+        continuous_prism_solution(
+            SOURCE,
+            TARGET,
+            LEFT_BASE,
+            APEX,
+            APEX,
+            RIGHT_BASE,
+            N_OUTSIDE,
+            N_PRISM,
+        )
+    )
+    if min(exact_u, 1.0 - exact_u, exact_v, 1.0 - exact_v) < 1e-8:
+        print("WARNING: the continuous optimum is at a prism vertex.")
+
+    entry_macro = snell_metrics(
+        SOURCE,
+        numerical_entry,
+        numerical_exit,
+        entry_line.normal,
+        N_OUTSIDE,
+        N_PRISM,
+    )
+    exit_macro = snell_metrics(
+        numerical_entry,
+        numerical_exit,
+        TARGET,
+        exit_line.normal,
+        N_PRISM,
+        N_OUTSIDE,
+    )
+    entry_local = snell_metrics(
+        graph.points[first_path[-2]],
+        numerical_entry,
+        graph.points[middle_path[1]],
+        entry_line.normal,
+        N_OUTSIDE,
+        N_PRISM,
+    )
+    exit_local = snell_metrics(
+        graph.points[middle_path[-2]],
+        numerical_exit,
+        graph.points[last_path[1]],
+        exit_line.normal,
+        N_PRISM,
+        N_OUTSIDE,
+    )
+
+    result = {
+        "graph": graph,
+        "path": path,
+        "path_points": tuple(graph.points[node] for node in path),
+        "entry_nodes": entry_nodes,
+        "exit_nodes": exit_nodes,
+        "numerical_entry": numerical_entry,
+        "numerical_exit": numerical_exit,
+        "exact_entry": exact_entry,
+        "exact_exit": exact_exit,
+        "exact_u": exact_u,
+        "exact_v": exact_v,
+        "numerical_optical_path": numerical_optical_path,
+        "exact_optical_path": exact_optical_path,
+        "relative_error": (numerical_optical_path - exact_optical_path)
+        / exact_optical_path,
+        "entry_macro": entry_macro,
+        "exit_macro": exit_macro,
+        "entry_local": entry_local,
+        "exit_local": exit_local,
+        "exit_functional": tuple(
+            (
+                segment_parameter(APEX, RIGHT_BASE, graph.points[node]),
+                through_prism.distances[node] + from_target.distances[node],
+            )
+            for node in reachable_exit
+        ),
+        "settled_nodes": (
+            from_source.settled_nodes
+            + through_prism.settled_nodes
+            + from_target.settled_nodes
+        ),
+        "relaxations": (
+            from_source.relaxations
+            + through_prism.relaxations
+            + from_target.relaxations
+        ),
+    }
+    return result
+
+
+# =============================================================================
+# Output and plots
+# =============================================================================
+
+def print_result(result: dict[str, object]) -> None:
+    graph: Graph = result["graph"]  # type: ignore[assignment]
+    print("\n=== TRIANGULAR PRISM RESULT ===")
+    print(f"h = {H:g}, q = {Q}, n_outside = {N_OUTSIDE:g}, n_prism = {N_PRISM:g}")
+    print(f"Continuous P1 = {result['exact_entry']}")
+    print(f"Graph      P1 = {result['numerical_entry']}")
+    print(f"Continuous P2 = {result['exact_exit']}")
+    print(f"Graph      P2 = {result['numerical_exit']}")
+    print(f"Continuous OPL = {result['exact_optical_path']:.12f}")
+    print(f"Graph OPL      = {result['numerical_optical_path']:.12f}")
+    print(f"Relative error = {result['relative_error']:.6e}")
+    print(
+        "Entry macro angles/residual = "
+        f"{result['entry_macro'][0]:.3f} deg, "  # type: ignore[index]
+        f"{result['entry_macro'][1]:.3f} deg, "  # type: ignore[index]
+        f"{result['entry_macro'][2] / max(N_OUTSIDE, N_PRISM):.6f}"  # type: ignore[index]
+    )
+    print(
+        "Exit  macro angles/residual = "
+        f"{result['exit_macro'][0]:.3f} deg, "  # type: ignore[index]
+        f"{result['exit_macro'][1]:.3f} deg, "  # type: ignore[index]
+        f"{result['exit_macro'][2] / max(N_OUTSIDE, N_PRISM):.6f}"  # type: ignore[index]
+    )
+    print(
+        "Normalized local residuals = "
+        f"{result['entry_local'][2] / max(N_OUTSIDE, N_PRISM):.6f}, "  # type: ignore[index]
+        f"{result['exit_local'][2] / max(N_OUTSIDE, N_PRISM):.6f}"  # type: ignore[index]
+    )
+    print("Contacts: entry = 1, exit = 1, base = 0")
+    print(
+        f"Graph: {len(graph.points):,} nodes, {graph.edge_count:,} edges, "
+        f"{len(result['path'])} path nodes"  # type: ignore[arg-type]
+    )
+
+
+def plot_geometry(result: dict[str, object]) -> plt.Figure:
+    graph: Graph = result["graph"]  # type: ignore[assignment]
+    path_points: tuple[Point, ...] = result["path_points"]  # type: ignore[assignment]
+    exact_path = (
+        SOURCE,
+        result["exact_entry"],
+        result["exact_exit"],
+        TARGET,
+    )
+    vertices = (LEFT_BASE, APEX, RIGHT_BASE, LEFT_BASE)
+    figure, axis = plt.subplots(figsize=(10.2, 7.0))
+    axis.fill(
+        [point[0] for point in vertices],
+        [point[1] for point in vertices],
+        color="#fdd0a2",
+        alpha=0.55,
+        label=f"prism, n={N_PRISM:g}",
+    )
+    axis.plot(
+        [point[0] for point in vertices],
+        [point[1] for point in vertices],
+        color="black",
+        linewidth=1.6,
+    )
+    if SHOW_ALL_NODES:
+        surface = result["entry_nodes"] | result["exit_nodes"]  # type: ignore[operator]
+        ordinary = [
+            point
+            for node_id, point in enumerate(graph.points)
+            if node_id not in surface
+        ]
+        axis.scatter(
+            [point[0] for point in ordinary],
+            [point[1] for point in ordinary],
+            s=4,
+            color="0.72",
+            alpha=0.35,
+            linewidths=0,
+        )
+    axis.plot(
+        [point[0] for point in exact_path],  # type: ignore[index]
+        [point[1] for point in exact_path],  # type: ignore[index]
+        "--",
+        color="#377eb8",
+        linewidth=2.0,
+        label="continuous minimum",
+    )
+    axis.plot(
+        [point[0] for point in path_points],
+        [point[1] for point in path_points],
+        "o-",
+        color="#d62728",
+        markersize=3.2,
+        linewidth=2.1,
+        label="Moser-Dijkstra path",
+    )
+    axis.scatter(*SOURCE, s=60, facecolor="white", edgecolor="black", zorder=5)
+    axis.scatter(*TARGET, s=60, facecolor="white", edgecolor="black", zorder=5)
+    axis.scatter(*result["numerical_entry"], s=60, color="#d62728", zorder=6)  # type: ignore[arg-type]
+    axis.scatter(*result["numerical_exit"], s=60, color="#d62728", zorder=6)  # type: ignore[arg-type]
+    axis.set(
+        title=f"Triangular prism: h={H:g}, q={Q}, n={N_PRISM:g}",
+        xlabel="x",
+        ylabel="y",
+        xlim=(DOMAIN[0], DOMAIN[1]),
+        ylim=(DOMAIN[2], DOMAIN[3]),
+    )
+    axis.set_aspect("equal", adjustable="box")
+    axis.grid(alpha=0.2)
+    axis.legend(frameon=False, loc="lower left")
+    figure.tight_layout()
+    return figure
+
+
+def plot_functional(result: dict[str, object]) -> plt.Figure:
+    parameter = np.linspace(0.0, 1.0, 251)
+    first_parameter, second_parameter = np.meshgrid(parameter, parameter)
+    entry_vector = segment_vector(LEFT_BASE, APEX)
+    exit_vector = segment_vector(APEX, RIGHT_BASE)
+    first_x = LEFT_BASE[0] + first_parameter * entry_vector[0]
+    first_y = LEFT_BASE[1] + first_parameter * entry_vector[1]
+    second_x = APEX[0] + second_parameter * exit_vector[0]
+    second_y = APEX[1] + second_parameter * exit_vector[1]
+    optical_path = (
+        N_OUTSIDE * np.hypot(first_x - SOURCE[0], first_y - SOURCE[1])
+        + N_PRISM * np.hypot(second_x - first_x, second_y - first_y)
+        + N_OUTSIDE * np.hypot(TARGET[0] - second_x, TARGET[1] - second_y)
+    )
+    numerical_u = segment_parameter(
+        LEFT_BASE, APEX, result["numerical_entry"]  # type: ignore[arg-type]
+    )
+    numerical_v = segment_parameter(
+        APEX, RIGHT_BASE, result["numerical_exit"]  # type: ignore[arg-type]
+    )
+    discrete = sorted(result["exit_functional"])  # type: ignore[arg-type]
+
+    figure, axes = plt.subplots(1, 2, figsize=(11.2, 4.8))
+    contour = axes[0].contourf(
+        first_parameter,
+        second_parameter,
+        optical_path,
+        levels=28,
+        cmap="viridis",
+    )
+    axes[0].scatter(
+        result["exact_u"],
+        result["exact_v"],
+        marker="x",
+        s=75,
+        color="white",
+        linewidth=2,
+        label="continuous minimum",
+    )
+    axes[0].scatter(
+        numerical_u,
+        numerical_v,
+        s=40,
+        color="#d62728",
+        label="graph minimum",
+    )
+    axes[0].set(
+        title="Joint functional L(u1, u2)",
+        xlabel="entry parameter u1",
+        ylabel="exit parameter u2",
+    )
+    axes[0].legend(frameon=False, fontsize=8)
+    figure.colorbar(contour, ax=axes[0], label="OPL")
+
+    axes[1].plot(
+        parameter,
+        optical_path.min(axis=1),
+        color="#377eb8",
+        linewidth=2,
+        label="continuous min over u1",
+    )
+    axes[1].plot(
+        [item[0] for item in discrete],
+        [item[1] for item in discrete],
+        "o-",
+        color="#d62728",
+        markersize=3,
+        linewidth=1.2,
+        label="multi-source graph functional",
+    )
+    axes[1].axvline(result["exact_v"], color="#377eb8", linestyle="--")
+    axes[1].axvline(numerical_v, color="#d62728", linestyle=":")
+    axes[1].set(
+        title="Reduced functional at the exit face",
+        xlabel="exit parameter u2",
+        ylabel="OPL",
+    )
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(frameon=False, fontsize=8)
+    figure.tight_layout()
+    return figure
+
+
+def main() -> None:
+    result = solve_prism()
+    print_result(result)
+    geometry_figure = plot_geometry(result)
+    functional_figure = plot_functional(result)
+    if SAVE_FIGURES:
+        OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        geometry_figure.savefig(
+            OUTPUT_DIRECTORY / "prism_geometry.png", dpi=250, bbox_inches="tight"
+        )
+        functional_figure.savefig(
+            OUTPUT_DIRECTORY / "prism_functional.png", dpi=250, bbox_inches="tight"
+        )
+        print(f"Figures saved in: {OUTPUT_DIRECTORY.resolve()}")
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
